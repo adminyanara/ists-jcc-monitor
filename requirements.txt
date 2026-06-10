@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+pdfplumber
+anthropic
+notion-client
+msal
