@@ -1,11 +1,15 @@
 import os
 import json
+import time
 import smtplib
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pdfplumber
 import anthropic
 
@@ -22,8 +26,68 @@ MAX_CHARS_PER_PDF = 8000
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_TOKENS = 4096
 
-# Email method: "graph" (Microsoft Graph API) or "smtp" (SMTP AUTH)
-# Auto-detected based on which secrets are set
+# Only download PDFs from these domains
+# External govt sites (cercind.gov.in, etc.) block datacenter IPs
+ALLOWED_DOMAINS = [
+    "ctuil.in",
+    "www.ctuil.in",
+]
+
+# Delay between PDF downloads (seconds) — avoids rate limiting
+DOWNLOAD_DELAY = 2
+
+# Max retries per PDF download
+MAX_RETRIES = 3
+
+
+# ══════════════════════════════════════════════
+# HELPER: CREATE A RESILIENT HTTP SESSION
+# ══════════════════════════════════════════════
+def create_session():
+    """Create a requests session with retry logic and browser-like headers."""
+    session = requests.Session()
+
+    # Retry on connection errors, 500s, 502s, 503s, 504s
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=2,           # Wait 2s, 4s, 8s between retries
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "application/pdf,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+
+    return session
+
+
+# ══════════════════════════════════════════════
+# HELPER: CHECK IF URL IS FROM ALLOWED DOMAIN
+# ══════════════════════════════════════════════
+def is_allowed_domain(url):
+    """Check if the PDF URL is from an allowed domain."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    return any(domain == allowed or domain.endswith(f".{allowed}")
+               for allowed in ALLOWED_DOMAINS)
+
+
+# ══════════════════════════════════════════════
+# EMAIL METHOD DETECTION
+# ══════════════════════════════════════════════
 def get_email_method():
     if os.environ.get("AZURE_CLIENT_ID") and os.environ.get("AZURE_TENANT_ID"):
         return "graph"
@@ -36,56 +100,65 @@ def get_email_method():
 # ══════════════════════════════════════════════
 # STEP 1: FETCH PAGE AND EXTRACT PDF LINKS
 # ══════════════════════════════════════════════
-def fetch_pdf_links():
+def fetch_pdf_links(session):
     """Scrape the CTUIL ISTS JCC page for all PDF download links."""
     print(f"[1/6] Fetching page: {CTUIL_URL}")
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(CTUIL_URL, headers=headers, timeout=30)
+    resp = session.get(CTUIL_URL, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
     pdf_links = []
+    skipped_external = 0
 
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"].strip()
         if href.lower().endswith(".pdf"):
+            # Build full URL
             if href.startswith("/"):
                 url = f"https://ctuil.in{href}"
             elif not href.startswith("http"):
                 url = f"https://ctuil.in/{href}"
             else:
                 url = href
-            link_text = a_tag.get_text(strip=True) or url.split("/")[-1]
-            pdf_links.append({"url": url, "text": link_text})
 
-    print(f"      Found {len(pdf_links)} PDF link(s) on page.")
+            # Filter: only allowed domains
+            if is_allowed_domain(url):
+                link_text = a_tag.get_text(strip=True) or url.split("/")[-1]
+                pdf_links.append({"url": url, "text": link_text})
+            else:
+                skipped_external += 1
+
+    print(f"      Found {len(pdf_links)} PDF link(s) from allowed domains.")
+    if skipped_external > 0:
+        print(f"      Skipped {skipped_external} external PDF link(s) "
+              f"(cercind.gov.in, etc. — block datacenter IPs).")
     return pdf_links
 
 
 # ══════════════════════════════════════════════
 # STEP 2: DOWNLOAD PDF AND EXTRACT TEXT
 # ══════════════════════════════════════════════
-def download_and_extract(pdf_url):
-    """Download a PDF and extract text using pdfplumber."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(pdf_url, headers=headers, timeout=120)
-    resp.raise_for_status()
+def download_and_extract(session, pdf_url):
+    """Download a PDF and extract text. Returns text or error string."""
+    try:
+        resp = session.get(pdf_url, timeout=120)
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError as e:
+        return f"[DOWNLOAD FAILED — Connection rejected: {e}]"
+    except requests.exceptions.Timeout:
+        return f"[DOWNLOAD FAILED — Timed out after 120s]"
+    except requests.exceptions.HTTPError as e:
+        return f"[DOWNLOAD FAILED — HTTP {e.response.status_code}]"
+    except Exception as e:
+        return f"[DOWNLOAD FAILED — {type(e).__name__}: {e}]"
 
     tmp_path = "/tmp/ists_temp.pdf"
     with open(tmp_path, "wb") as f:
         f.write(resp.content)
+
+    # Check if we actually got a PDF (some servers return HTML error pages)
+    if resp.content[:5] != b"%PDF-":
+        return "[DOWNLOAD FAILED — Server returned non-PDF content]"
 
     text = ""
     try:
@@ -95,9 +168,9 @@ def download_and_extract(pdf_url):
                 if page_text:
                     text += page_text + "\n"
     except Exception as e:
-        text = f"[PDF extraction failed: {e}]"
+        return f"[PDF EXTRACTION FAILED — {type(e).__name__}: {e}]"
 
-    return text.strip()
+    return text.strip() if text.strip() else "[PDF EXTRACTION FAILED — No text found (scanned image?)]"
 
 
 # ══════════════════════════════════════════════
@@ -178,18 +251,16 @@ def get_graph_access_token():
         )
 
 
-def send_email_graph(digest, new_pdf_count, recipients):
-    """Send email via Microsoft Graph API (OAuth2 — future-proof)."""
+def send_email_graph(digest, new_pdf_count, failed_count, recipients):
+    """Send email via Microsoft Graph API."""
     sender_email = os.environ["SENDER_EMAIL"]
     print(f"[5/6] Sending email via Microsoft Graph API from {sender_email}...")
 
     access_token = get_graph_access_token()
     date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # Build HTML email body
-    html_body = build_html_email(digest, new_pdf_count, date_str)
+    html_body = build_html_email(digest, new_pdf_count, failed_count, date_str)
 
-    # Build Graph API request
     to_recipients = [
         {"emailAddress": {"address": email.strip()}}
         for email in recipients
@@ -226,14 +297,14 @@ def send_email_graph(digest, new_pdf_count, recipients):
 # ══════════════════════════════════════════════
 # STEP 4B: SEND EMAIL VIA SMTP AUTH (OFFICE 365)
 # ══════════════════════════════════════════════
-def send_email_smtp(digest, new_pdf_count, recipients):
-    """Send email via SMTP AUTH (Office 365). Works until Dec 2026."""
+def send_email_smtp(digest, new_pdf_count, failed_count, recipients):
+    """Send email via SMTP AUTH (Office 365)."""
     smtp_username = os.environ["SMTP_USERNAME"]
     smtp_password = os.environ["SMTP_PASSWORD"]
     print(f"[5/6] Sending email via SMTP AUTH from {smtp_username}...")
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    html_body = build_html_email(digest, new_pdf_count, date_str)
+    html_body = build_html_email(digest, new_pdf_count, failed_count, date_str)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = (
@@ -242,10 +313,10 @@ def send_email_smtp(digest, new_pdf_count, recipients):
     msg["From"] = smtp_username
     msg["To"] = ", ".join(recipients)
 
-    # Plain text fallback
     plain_body = (
         f"ISTS JCC Digest — {date_str}\n"
-        f"New documents processed: {new_pdf_count}\n\n"
+        f"New documents processed: {new_pdf_count}\n"
+        f"Failed downloads: {failed_count}\n\n"
         f"{digest}\n\n---\n"
         f"Source: {CTUIL_URL}"
     )
@@ -264,11 +335,7 @@ def send_email_smtp(digest, new_pdf_count, recipients):
     except smtplib.SMTPAuthenticationError as e:
         print(f"      ERROR: SMTP authentication failed.")
         print(f"      {e}")
-        print(f"      Possible causes:")
-        print(f"        - SMTP AUTH is disabled for your mailbox (ask IT to enable)")
-        print(f"        - Wrong password / app password needed (MFA is on)")
-        print(f"        - Your org has already migrated to OAuth-only")
-        print(f"      FIX: Switch to Microsoft Graph API (Path A) in secrets.")
+        print(f"      Try: App Password or switch to Graph API (Path A).")
     except Exception as e:
         print(f"      ERROR sending email: {e}")
 
@@ -276,12 +343,11 @@ def send_email_smtp(digest, new_pdf_count, recipients):
 # ══════════════════════════════════════════════
 # SHARED: BUILD HTML EMAIL
 # ══════════════════════════════════════════════
-def build_html_email(digest, new_pdf_count, date_str):
+def build_html_email(digest, new_pdf_count, failed_count, date_str):
     """Build a styled HTML email body."""
-    # Escape HTML in digest but preserve line breaks
     import html as html_module
     escaped_digest = html_module.escape(digest)
-    # Convert markdown-like headers to HTML
+
     lines = escaped_digest.split("\n")
     formatted_lines = []
     for line in lines:
@@ -306,6 +372,18 @@ def build_html_email(digest, new_pdf_count, date_str):
 
     body_content = "\n".join(formatted_lines)
 
+    # Warning banner if some downloads failed
+    warning_banner = ""
+    if failed_count > 0:
+        warning_banner = f"""
+        <div style="background-color:#fff3cd;border:1px solid #ffc107;
+                    border-radius:5px;padding:10px 15px;margin-bottom:15px;">
+            ⚠️ <strong>{failed_count} PDF(s) failed to download</strong>
+            (external govt sites may block datacenter IPs).
+            These will be retried in the next run.
+        </div>
+        """
+
     return f"""
     <html>
     <head>
@@ -322,14 +400,19 @@ def build_html_email(digest, new_pdf_count, date_str):
             }}
             .header h1 {{ color: white; margin: 0; font-size: 1.4em; }}
             .badge {{
-                display: inline-block; background-color: #e74c3c;
+                display: inline-block; background-color: #27ae60;
                 color: white; padding: 3px 10px;
                 border-radius: 4px; font-size: 0.85em; margin-top: 8px;
             }}
+            .badge-warn {{
+                display: inline-block; background-color: #e67e22;
+                color: white; padding: 3px 10px;
+                border-radius: 4px; font-size: 0.85em; margin-top: 8px;
+                margin-left: 5px;
+            }}
             .content {{
                 background: #ffffff; padding: 25px;
-                border: 1px solid #e0e0e0;
-                border-top: none;
+                border: 1px solid #e0e0e0; border-top: none;
             }}
             .footer {{
                 background: #f8f9fa; padding: 15px 25px;
@@ -337,22 +420,19 @@ def build_html_email(digest, new_pdf_count, date_str):
                 border-radius: 0 0 8px 8px;
                 font-size: 0.85em; color: #777;
             }}
-            table {{
-                border-collapse: collapse; width: 100%; margin: 10px 0;
-            }}
-            th, td {{
-                border: 1px solid #ddd; padding: 8px 12px; text-align: left;
-            }}
-            th {{ background-color: #1a5276; color: white; }}
-            tr:nth-child(even) {{ background-color: #f2f2f2; }}
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>ISTS JCC Digest — {date_str}</h1>
-            <span class="badge">{new_pdf_count} new document(s) processed</span>
+            <h1 style="color: white; border: none; margin: 0;">
+                ISTS JCC Digest — {date_str}
+            </h1>
+            <span class="badge">{new_pdf_count} document(s) processed</span>
+            {"<span class='badge-warn'>" + str(failed_count) + " failed</span>"
+             if failed_count > 0 else ""}
         </div>
         <div class="content">
+            {warning_banner}
             {body_content}
         </div>
         <div class="footer">
@@ -368,7 +448,7 @@ def build_html_email(digest, new_pdf_count, date_str):
 # ══════════════════════════════════════════════
 # STEP 4 DISPATCHER: SEND EMAIL
 # ══════════════════════════════════════════════
-def send_email_notification(digest, new_pdf_count):
+def send_email_notification(digest, new_pdf_count, failed_count):
     """Route email through the configured method."""
     notify_emails_raw = os.environ.get("NOTIFY_EMAILS", "")
     if not notify_emails_raw:
@@ -385,12 +465,11 @@ def send_email_notification(digest, new_pdf_count):
     method = get_email_method()
 
     if method == "graph":
-        send_email_graph(digest, new_pdf_count, recipients)
+        send_email_graph(digest, new_pdf_count, failed_count, recipients)
     elif method == "smtp":
-        send_email_smtp(digest, new_pdf_count, recipients)
+        send_email_smtp(digest, new_pdf_count, failed_count, recipients)
     else:
-        print("[SKIP] No email credentials configured (need either "
-              "AZURE_* or SMTP_* secrets). Skipping email.")
+        print("[SKIP] No email credentials configured. Skipping email.")
 
 
 # ══════════════════════════════════════════════
@@ -447,7 +526,11 @@ def main():
     print(f"  Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     email_method = get_email_method()
     print(f"  Email method: {email_method or 'NOT CONFIGURED'}")
+    print(f"  Allowed domains: {', '.join(ALLOWED_DOMAINS)}")
     print("=" * 60)
+
+    # Create resilient HTTP session
+    session = create_session()
 
     # Ensure directories exist
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -460,8 +543,8 @@ def main():
     else:
         processed = []
 
-    # Step 1: Fetch PDF links
-    pdf_links = fetch_pdf_links()
+    # Step 1: Fetch PDF links (filtered to allowed domains)
+    pdf_links = fetch_pdf_links(session)
 
     # Filter out already-processed PDFs
     new_pdfs = [p for p in pdf_links if p["url"] not in processed]
@@ -474,23 +557,43 @@ def main():
     # Step 2: Download and extract text
     print("[3/6] Downloading and extracting text...")
     extracted = []
-    for pdf in new_pdfs:
-        print(f"      -> {pdf['text']}")
-        print(f"         {pdf['url']}")
-        text = download_and_extract(pdf["url"])
-        if text and not text.startswith("[PDF extraction failed"):
+    failed = []
+
+    for i, pdf in enumerate(new_pdfs):
+        print(f"      [{i+1}/{len(new_pdfs)}] {pdf['text']}")
+        print(f"              {pdf['url']}")
+
+        text = download_and_extract(session, pdf["url"])
+
+        if text.startswith("["):
+            # This is an error message
+            print(f"              ❌ {text}")
+            failed.append({"name": pdf["text"], "url": pdf["url"], "error": text})
+            # Do NOT add to processed — retry next run
+        else:
             extracted.append({
                 "name": pdf["text"],
                 "content": text,
                 "url": pdf["url"],
             })
-            print(f"         Extracted {len(text)} characters.")
-        else:
-            print(f"         WARNING: {text}")
-        processed.append(pdf["url"])
+            print(f"              ✅ Extracted {len(text)} characters.")
+            # Mark as processed only on success
+            processed.append(pdf["url"])
+
+        # Delay between downloads to be polite to the server
+        if i < len(new_pdfs) - 1:
+            time.sleep(DOWNLOAD_DELAY)
+
+    print(f"\n      Summary: {len(extracted)} succeeded, {len(failed)} failed.")
+
+    if failed:
+        print(f"      Failed PDFs (will retry next run):")
+        for f_item in failed:
+            print(f"        - {f_item['name']}: {f_item['error']}")
 
     if not extracted:
         print("      No usable text extracted. Exiting.")
+        # Still save processed list
         with open(PROCESSED_FILE, "w") as f:
             json.dump(processed, f, indent=2)
         return
@@ -506,7 +609,7 @@ def main():
     print(f"      Digest saved: {digest_path}")
 
     # Step 4: Send email notification
-    send_email_notification(digest, len(extracted))
+    send_email_notification(digest, len(extracted), len(failed))
 
     # Step 5: Write to Notion (optional)
     write_to_notion(digest)
