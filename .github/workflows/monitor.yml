@@ -1,0 +1,58 @@
+name: ISTS JCC Monitor
+
+on:
+  # Scheduled: Every Monday at 03:00 UTC = 08:30 AM IST
+  schedule:
+    - cron: '0 3 * * 1'
+
+  # Manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ISTS JCC Monitor
+        env:
+          # Core
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTIFY_EMAILS: ${{ secrets.NOTIFY_EMAILS }}
+
+          # Path A: Microsoft Graph API
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+
+          # Path B: SMTP AUTH (fallback)
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+          # Optional: Notion
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: python monitor.py
+
+      - name: Commit results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/ digests/
+          git commit -m "Update ISTS JCC digest — $(date +'%Y-%m-%d') [skip ci]" || exit 0
+          git push
