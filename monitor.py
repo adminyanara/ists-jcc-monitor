@@ -17,7 +17,10 @@ import anthropic
 # ══════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════
-CTUIL_URL = "https://ctuil.in/ists-joint-coordination-meeting"
+CTUIL_URLS = [
+    "https://ctuil.in/ists-joint-coordination-meeting",
+    "https://ctuil.in/ists-consultation-meeting",
+]
 PROCESSED_FILE = "data/processed_pdfs.json"
 PROMPT_FILE = "prompt.md"
 DIGEST_DIR = "digests"
@@ -151,10 +154,10 @@ def get_email_method():
 # ══════════════════════════════════════════════
 # STEP 1: FETCH PAGE AND EXTRACT PDF LINKS
 # ══════════════════════════════════════════════
-def fetch_pdf_links(session):
-    """Scrape the CTUIL ISTS JCC page for relevant PDF links only."""
-    print(f"[1/6] Fetching page: {CTUIL_URL}")
-    resp = session.get(CTUIL_URL, timeout=30)
+def fetch_pdf_links(session, url):
+    """Scrape a CTUIL page for relevant PDF links only."""
+    print(f"[1/6] Fetching page: {url}")
+    resp = session.get(url, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -603,6 +606,7 @@ def main():
     print(f"  Email method: {email_method or 'NOT CONFIGURED'}")
     print(f"  Allowed domains: {', '.join(ALLOWED_DOMAINS)}")
     print(f"  Claude model: {CLAUDE_MODEL}")
+    print(f"  Monitoring {len(CTUIL_URLS)} page(s)")
     print("=" * 60)
 
     session = create_session()
@@ -617,8 +621,10 @@ def main():
     else:
         processed = []
 
-    # Step 1: Fetch relevant PDF links only
-    pdf_links = fetch_pdf_links(session)
+    # Step 1: Fetch relevant PDF links from all URLs
+    pdf_links = []
+    for url in CTUIL_URLS:
+        pdf_links.extend(fetch_pdf_links(session, url))
 
     new_pdfs = [p for p in pdf_links if p["url"] not in processed]
     print(f"[2/6] New PDFs to process: {len(new_pdfs)}")
