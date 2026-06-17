@@ -26,7 +26,7 @@ PROMPT_FILE = "prompt.md"
 DIGEST_DIR = "digests"
 DATA_DIR = "data"
 MAX_CHARS_PER_PDF = 8000
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_MAX_TOKENS = 4096
 
 # Only download PDFs from these domains
